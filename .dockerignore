@@ -1,0 +1,4 @@
+venv_ia/
+__pycache__/
+*.db
+.env

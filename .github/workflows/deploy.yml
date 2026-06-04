@@ -1,0 +1,42 @@
+name: Despliegue Automático AWS
+
+# Esto indica que el robot se activará cada vez que hagas push a la rama "main"
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Descargar código del repositorio
+        uses: actions/checkout@v3
+
+      - name: 🚀 Transferir archivos a AWS
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "."
+          target: "/home/ubuntu/backend"
+          # Evita subir tu entorno virtual pesado de Windows o sobreescribir la BD
+          exclude: "venv_ia/*,.git/*,__pycache__/*,*.db"
+
+      - name: ⚙️ Reconstruir y Reiniciar Docker
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /home/ubuntu/backend
+            
+            # Construye la nueva imagen con los cambios
+            sudo docker build --no-cache -t api-votacion .
+            
+            # Detiene y borra el contenedor viejo
+            sudo docker rm -f servidor-biometrico
+            
+            # Enciende el nuevo usando el VOLUMEN de la base de datos protegida
+            sudo docker run -d -p 8000:8000 -v /home/ubuntu/votacion.db:/app/votacion.db --name servidor-biometrico api-votacion

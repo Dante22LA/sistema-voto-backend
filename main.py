@@ -1,0 +1,570 @@
+import os
+import base64
+import pickle
+import cv2
+import numpy as np
+import boto3
+from botocore.exceptions import NoCredentialsError
+from deepface import DeepFace
+from dotenv import load_dotenv
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+from fastapi import Form, UploadFile, File
+
+from database import SessionLocal, engine, Base
+import models
+
+# Carga las variables de entorno si estás haciendo pruebas en tu computadora local
+load_dotenv()
+
+# ── Configuración de AWS S3 ────────────────────────────────────────────────────
+AWS_REGION = "us-east-2" 
+BUCKET_NAME = "blindaje-biometrico-fotos-agurto"
+
+# El cliente S3 ahora jala las llaves de los secretos de GitHub Actions usando os.getenv()
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    region_name=AWS_REGION
+)
+
+load_dotenv()
+
+# ── Crear tablas ───────────────────────────────────────────────────────────────
+Base.metadata.create_all(bind=engine)
+
+# ── CREACIÓN DE CARPETAS LOCALES ───────────────────────────────────────────────
+os.makedirs("uploads/partidos", exist_ok=True)
+os.makedirs("uploads/ciudadanos", exist_ok=True)
+
+# ── FastAPI ────────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title   = "API Electoral · Blindaje Biométrico (Modo Local)",
+    version = "2.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Montamos la carpeta "uploads" para que Android y el navegador puedan ver las fotos
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+# ── DB dependency ──────────────────────────────────────────────────────────────
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# ── Helper: Subir imagen a Amazon S3 ──────────────────────────────────────────
+def subir_foto_s3(foto_base64: str, carpeta: str, nombre_archivo: str) -> str:
+    image_data = base64.b64decode(foto_base64)
+    ruta_s3 = f"{carpeta}/{nombre_archivo}.jpg"
+    
+    try:
+        s3_client.put_object(
+            Bucket=BUCKET_NAME,
+            Key=ruta_s3,
+            Body=image_data,
+            ContentType='image/jpeg'
+        )
+        # Retornamos la URL pública de S3 para guardar en la base de datos
+        return f"https://{BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{ruta_s3}"
+    except NoCredentialsError:
+        raise HTTPException(status_code=500, detail="Error de credenciales de AWS S3")
+
+def subir_foto_partido(foto_base64: str, public_id: str) -> str:
+    return subir_foto_s3(foto_base64, "partidos", public_id)
+
+def subir_foto_ciudadano(foto_base64: str, public_id: str) -> str:
+    return subir_foto_s3(foto_base64, "ciudadanos", public_id)
+
+
+def generar_embedding_s3(foto_url: str):
+    """Descarga la imagen directamente desde S3 a la memoria RAM para DeepFace"""
+    
+    # 1. Extraer solo el "Key" interno de la URL de S3
+    # Ejemplo: quita el dominio y deja solo "ciudadanos/12345678.jpg"
+    s3_key = foto_url.split(".amazonaws.com/")[-1]
+    
+    try:
+        # 2. Descargar los bytes puros usando Boto3 (Garantiza integridad 100%)
+        respuesta = s3_client.get_object(Bucket=BUCKET_NAME, Key=s3_key)
+        image_data = respuesta['Body'].read()
+        
+        # 3. Convertir los bytes a una matriz de OpenCV 
+        nparr = np.frombuffer(image_data, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        # 4. Generar el embedding pasando la matriz 'img' en lugar de un texto
+        resultado = DeepFace.represent(
+            img_path = img, 
+            model_name = "Facenet512",
+            detector_backend = "opencv",
+            enforce_detection= False  
+        )
+        return resultado[0]["embedding"]
+        
+    except Exception as e:
+        print(f"Error procesando imagen de S3: {e}")
+        raise e
+
+# ── Schemas Pydantic ───────────────────────────────────────────────────────────
+class DNIRequest(BaseModel):
+    dni: str
+
+class HuellaRequest(BaseModel):
+    votante_id: int
+    huella_exitosa: bool
+
+class RostroRequest(BaseModel):
+    votante_id: int
+    rostro_exitoso: bool
+    foto_base64: str = None
+
+class VotoRequest(BaseModel):
+    votante_id: int
+    partido_id: int
+
+class PartidoCreate(BaseModel):
+    nombre: str
+    siglas: str
+    foto_base64: str
+
+class CiudadanoCreate(BaseModel):
+    dni: str
+    nombre: str
+    foto_base64: str
+
+@app.get("/admin/debug/{dni}")
+def debug_votante(dni: str, db: Session = Depends(get_db)):
+    dni_limpio = dni.strip()
+    
+    v = db.query(models.Votante).filter(models.Votante.dni == dni_limpio).first()
+    if not v:
+        try:
+            v = db.query(models.Votante).filter(models.Votante.dni == int(dni_limpio)).first()
+        except ValueError:
+            pass
+            
+    if not v:
+        return {"error": "no encontrado en la base de datos local"}
+        
+    return {
+        "dni": v.dni,
+        "tiene_foto_url": v.foto_url is not None,
+        "foto_url": v.foto_url,
+        "tiene_embedding": v.face_embedding is not None,
+    }
+
+@app.get("/admin/test-distancia/{dni}")
+def test_distancia(dni: str, db: Session = Depends(get_db)):
+    votante = db.query(models.Votante).filter(models.Votante.dni == dni).first()
+    if not votante or not votante.foto_url:
+        return {"error": "no encontrado"}
+    
+    try:
+        embedding_oficial = generar_embedding_s3(votante.foto_url)
+        return {
+            "ok": True,
+            "embedding_len": len(embedding_oficial),
+            "foto_url": votante.foto_url
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PANEL ADMIN (sirve el HTML)
+# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/admin", include_in_schema=False)
+def panel_admin():
+    return FileResponse("admin_panel.html")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PARTIDOS
+# ══════════════════════════════════════════════════════════════════════════════
+@app.post("/admin/partidos")
+def crear_partido(request: PartidoCreate, db: Session = Depends(get_db)):
+    existente = db.query(models.PartidoPolitico).filter(
+        models.PartidoPolitico.siglas == request.siglas
+    ).first()
+    if existente:
+        raise HTTPException(status_code=400, detail=f"Las siglas '{request.siglas}' ya están registradas.")
+
+    try:
+        foto_url = subir_foto_partido(request.foto_base64, request.siglas.lower())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error subiendo imagen: {str(e)}")
+
+    partido = models.PartidoPolitico(
+        nombre   = request.nombre,
+        siglas   = request.siglas,
+        foto_url = foto_url
+    )
+    db.add(partido)
+    db.commit()
+    return {"mensaje": "Partido registrado con éxito"}
+
+
+@app.get("/partidos")
+def listar_partidos(db: Session = Depends(get_db)):
+    partidos = db.query(models.PartidoPolitico).all()
+    return [
+        {"id": p.id, "nombre": p.nombre, "siglas": p.siglas, "foto_url": p.foto_url}
+        for p in partidos
+    ]
+
+
+@app.delete("/admin/partidos/{partido_id}")
+def eliminar_partido(partido_id: int, db: Session = Depends(get_db)):
+    partido = db.query(models.PartidoPolitico).filter(
+        models.PartidoPolitico.id == partido_id
+    ).first()
+    if not partido:
+        raise HTTPException(status_code=404, detail="Partido no encontrado.")
+
+    # Borrar archivo físico
+    try:
+        ruta_fisica = partido.foto_url.lstrip("/")
+        if os.path.exists(ruta_fisica):
+            os.remove(ruta_fisica)
+    except Exception:
+        pass
+
+    db.delete(partido)
+    db.commit()
+    return {"mensaje": "Partido eliminado."}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CIUDADANOS (padrón electoral)
+# ══════════════════════════════════════════════════════════════════════════════
+@app.post("/admin/ciudadanos")
+def registrar_ciudadano(request: CiudadanoCreate, db: Session = Depends(get_db)):
+    if not request.dni.isdigit() or len(request.dni) != 8:
+        raise HTTPException(status_code=400, detail="DNI inválido.")
+
+    try:
+        foto_url = subir_foto_ciudadano(request.foto_base64, request.dni)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error guardando foto local: {str(e)}")
+
+    try:
+        embedding = generar_embedding_s3(foto_url)
+        embedding_bytes = pickle.dumps(embedding)
+    except Exception as e:
+        print(f"ADVERTENCIA: No se pudo generar embedding para {request.dni}: {e}")
+        embedding_bytes = None
+
+    votante = db.query(models.Votante).filter(
+        models.Votante.dni == request.dni
+    ).first()
+
+    if votante:
+        votante.nombre         = request.nombre
+        votante.foto_url       = foto_url
+        votante.face_embedding = embedding_bytes 
+        votante.rostro_validado = False
+        votante.huella_validada = False
+    else:
+        votante = models.Votante(
+            dni             = request.dni,
+            nombre          = request.nombre,
+            foto_url        = foto_url,
+            face_embedding  = embedding_bytes,  
+            huella_validada = False,
+            rostro_validado = False,
+            ha_votado       = False
+        )
+        db.add(votante)
+
+    db.commit()
+    return {"mensaje": f"Ciudadano {request.dni} registrado con éxito.", "foto_url": foto_url}
+
+
+@app.get("/admin/ciudadanos")
+def listar_ciudadanos(db: Session = Depends(get_db)):
+    votantes = db.query(models.Votante).all()
+    return [
+        {
+            "id":        v.id,
+            "dni":       v.dni,
+            "nombre":    v.nombre,
+            "foto_url":  v.foto_url,
+            "tiene_foto": v.foto_url is not None,
+            "ha_votado": v.ha_votado,
+        }
+        for v in votantes
+    ]
+
+@app.get("/admin/verificaciones-faciales")
+def listar_verificaciones(db: Session = Depends(get_db)):
+    votantes = db.query(models.Votante).all()
+    return [
+        {
+            "id": v.id,
+            "dni": v.dni,
+            "rostro_validado": v.rostro_validado,
+            "huella_validada": v.huella_validada,
+            "ha_votado": v.ha_votado,
+            "foto_url":  v.foto_url,
+        }
+        for v in votantes
+    ]
+
+
+@app.delete("/admin/ciudadanos/{votante_id}")
+def eliminar_ciudadano(votante_id: int, db: Session = Depends(get_db)):
+    votante = db.query(models.Votante).filter(
+        models.Votante.id == votante_id
+    ).first()
+    if not votante:
+        raise HTTPException(status_code=404, detail="Ciudadano no encontrado.")
+
+    # Borrar archivo físico
+    try:
+        ruta_fisica = votante.foto_url.lstrip("/")
+        if os.path.exists(ruta_fisica):
+            os.remove(ruta_fisica)
+    except Exception:
+        pass
+
+    db.delete(votante)
+    db.commit()
+    return {"mensaje": "Ciudadano eliminado."}
+
+
+@app.get("/admin/votantes")
+def total_votantes(db: Session = Depends(get_db)):
+    total = db.query(func.count(models.Votante.id)).scalar()
+    return {"total": total}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTENTICACIÓN / VOTACIÓN
+# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/")
+def raiz():
+    return {"mensaje": "Servidor Electoral Activo · v2.0 (Local)"}
+
+
+@app.post("/auth/register-dni")
+def registrar_dni(request: DNIRequest, db: Session = Depends(get_db)):
+    dni_limpio = request.dni.strip()
+    
+    if not dni_limpio.isdigit() or len(dni_limpio) != 8:
+        raise HTTPException(status_code=400, detail="DNI inválido.")
+
+    votante = db.query(models.Votante).filter(models.Votante.dni == dni_limpio).first()
+    if not votante:
+        try:
+            votante = db.query(models.Votante).filter(models.Votante.dni == int(dni_limpio)).first()
+        except ValueError:
+            pass
+
+    if not votante or not votante.foto_url:
+        raise HTTPException(
+            status_code=404,
+            detail="DNI no registrado. El administrador debe subir la foto primero."
+        )
+
+    if votante.ha_votado:
+        raise HTTPException(status_code=403, detail="Este DNI ya emitió su voto.")
+
+    votante.huella_validada = False
+    votante.rostro_validado = False
+    db.commit()
+    db.refresh(votante)
+
+    return {
+        "mensaje"   : "DNI reconocido",
+        "votante_id": votante.id,
+        "datos_oficiales": {
+            "dni"             : str(votante.dni),
+            "foto_oficial_url": votante.foto_url, 
+            "nombre_simulado" : "CIUDADANO REGISTRADO"
+        }
+    }
+
+@app.post("/admin/upload-dni-foto")
+async def subir_foto_dni(
+    dni: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    if not dni.isdigit() or len(dni) != 8:
+        raise HTTPException(status_code=400, detail="DNI inválido")
+
+    contenido   = await file.read()
+    foto_base64 = base64.b64encode(contenido).decode("utf-8")
+
+    try:
+        foto_url = subir_foto_ciudadano(foto_base64, dni)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error guardando foto: {str(e)}")
+
+    votante = db.query(models.Votante).filter(
+        models.Votante.dni == dni
+    ).first()
+
+    if votante:
+        votante.foto_url       = foto_url
+        votante.face_embedding = None 
+        votante.rostro_validado = False
+        votante.huella_validada = False
+    else:
+        votante = models.Votante(
+            dni             = dni,
+            foto_url        = foto_url,
+            face_embedding  = None,
+            huella_validada = False,
+            rostro_validado = False,
+            ha_votado       = False
+        )
+        db.add(votante)
+
+    db.commit()
+    return {"mensaje": "Foto guardada", "foto_url": foto_url}
+
+
+@app.post("/auth/verify-face")
+def verificar_rostro(request: RostroRequest, db: Session = Depends(get_db)):
+    votante = db.query(models.Votante).filter(
+        models.Votante.id == request.votante_id
+    ).first()
+    if not votante:
+        raise HTTPException(status_code=404, detail="Votante no encontrado.")
+    if not request.foto_base64:
+        raise HTTPException(status_code=400, detail="Captura facial vacía.")
+
+    # Limpieza por si Android envía cabeceras extrañas
+    base64_data = request.foto_base64
+    if "," in base64_data:
+        base64_data = base64_data.split(",")[1]
+
+    try:
+        image_data = base64.b64decode(base64_data)
+        nparr = np.frombuffer(image_data, np.uint8)
+        img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Imagen corrupta al decodificar.")
+
+    try:
+        # EL CAMBIO ESTRELLA: Usar 'mtcnn' en lugar de 'opencv'
+        current = DeepFace.represent(
+            img_path         = img,
+            model_name       = "Facenet512",
+            detector_backend = "mtcnn", # Más potente y tolerante a la rotación móvil
+            enforce_detection= True     # Obligamos a que de verdad evalúe una cara
+        )[0]["embedding"]
+
+        if votante.face_embedding is None:
+            # Ahora compara contra la foto en el almacén S3
+            embedding_oficial = generar_embedding_s3(votante.foto_url)
+            distancia = np.linalg.norm(
+                np.array(current) - np.array(embedding_oficial)
+            )
+            print(f"Distancia facial (vs foto oficial S3) para {votante.dni}: {distancia}")
+
+            if distancia < 10:
+                votante.face_embedding  = pickle.dumps(current)
+                votante.rostro_validado = True  # <-- ¡CORREGIDO! Antes decía False
+                db.commit()
+                return {"mensaje": "Acceso biométrico concedido."}
+            else:
+                raise HTTPException(status_code=401, detail="Rostro no coincide con la foto oficial.")
+        else:
+            stored    = pickle.loads(votante.face_embedding)
+            distancia = np.linalg.norm(np.array(current) - np.array(stored))
+            print(f"Distancia facial (vs embedding guardado) para {votante.dni}: {distancia}")
+
+            if distancia < 10:
+                votante.rostro_validado = True  # <-- ¡CORREGIDO! Antes decía False
+                db.commit()
+                return {"mensaje": "Acceso biométrico concedido."}
+            else:
+                raise HTTPException(status_code=401, detail="Rostro no coincide.")
+
+    except ValueError as ve:
+        print("ERROR DE DETECCIÓN FACIAL:", str(ve))
+        raise HTTPException(status_code=422, detail="Intente tomar la foto de frente y con buena luz.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("ERROR BIOMETRÍA:", str(e))
+        raise HTTPException(status_code=500, detail="Error interno en reconocimiento facial.")
+
+
+@app.post("/auth/verify-fingerprint")
+def verificar_huella(request: HuellaRequest, db: Session = Depends(get_db)):
+    votante = db.query(models.Votante).filter(
+        models.Votante.id == request.votante_id
+    ).first()
+    if not votante:
+        raise HTTPException(status_code=404, detail="Votante no encontrado.")
+
+    if request.huella_exitosa:
+        votante.huella_validada = True
+        db.commit()
+        return {"mensaje": "Huella validada con éxito."}
+    else:
+        raise HTTPException(status_code=401, detail="Fallo en validación de huella.")
+
+
+@app.post("/voting/cast")
+def emitir_voto(request: VotoRequest, db: Session = Depends(get_db)):
+    votante = db.query(models.Votante).filter(
+        models.Votante.id == request.votante_id
+    ).first()
+    if not votante:
+        raise HTTPException(status_code=404, detail="Votante no encontrado.")
+    if votante.ha_votado:
+        raise HTTPException(status_code=403, detail="Ya has votado.")
+    if not votante.huella_validada or not votante.rostro_validado:
+        raise HTTPException(status_code=403, detail="Falta validación multifactor.")
+
+    voto = models.Voto(partido_id=request.partido_id)
+    votante.ha_votado = True
+    db.add(voto)
+    db.commit()
+    return {"mensaje": "Voto registrado correctamente."}
+
+
+@app.get("/admin/results")
+def conteo_votos(db: Session = Depends(get_db)):
+    resultados = db.query(
+        models.PartidoPolitico.nombre,
+        models.PartidoPolitico.siglas,
+        func.count(models.Voto.id).label("total_votos")
+    ).outerjoin(
+        models.Voto, models.PartidoPolitico.id == models.Voto.partido_id
+    ).group_by(
+        models.PartidoPolitico.id
+    ).all()
+
+    return {
+        "mensaje"   : "Reporte de resultados",
+        "resultados": [{"partido": n, "siglas": s, "votos": t} for n, s, t in resultados]
+    }
+
+@app.delete("/admin/votantes/{dni}")
+def eliminar_votante(dni: str, db: Session = Depends(get_db)):
+    # Busca al ciudadano por su DNI en la base de datos
+    votante = db.query(models.Votante).filter(models.Votante.dni == dni).first()
+    
+    if not votante:
+        raise HTTPException(status_code=404, detail="Votante no encontrado")
+    
+    # Lo elimina de la base de datos (el "Fantasma" desaparece)
+    db.delete(votante)
+    db.commit()
+    return {"mensaje": f"Votante con DNI {dni} eliminado correctamente"}

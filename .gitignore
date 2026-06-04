@@ -1,0 +1,60 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Entornos virtuales
+venv/
+.venv/
+ENV/
+venv_ia/          # <-- AÑADIDO: Tu entorno específico de la captura
+
+# Archivos de configuración local
+.env
+
+debug_*
+
+# IDE / editores
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+
+# Build / paquetes
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# SQLite (Evita sobreescribir la BD en producción)
+*.sqlite3
+*.db
+votacion.db       # <-- AÑADIDO: Seguro extra para tu archivo exacto
+
+# Secrets / credenciales
+secrets.json
+credentials.json
+
+# Archivos temporales
+*.tmp
+*.bak
+
+# Archivos multimedia locales (Migrados a AWS S3)
+uploads/          # <-- MODIFICADO: Ignora toda la carpeta de golpe, ya no la necesitamos en local
