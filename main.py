@@ -584,3 +584,13 @@ def eliminar_votante(dni: str, db: Session = Depends(get_db)):
     db.delete(votante)
     db.commit()
     return {"mensaje": f"Votante con DNI {dni} eliminado correctamente"}
+
+@app.get("/admin", include_in_schema=False)
+def panel_admin():
+    # Añadir headers para matar el caché del navegador para siempre
+    headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0"
+    }
+    return FileResponse("admin_panel.html", headers=headers)
