@@ -91,30 +91,45 @@ def subir_foto_ciudadano(foto_base64: str, public_id: str) -> str:
     return subir_foto_s3(foto_base64, "ciudadanos", public_id)
 
 
+# ── Helper: Extracción de rostro a prueba de fallos (Auto-Rotador) ─────────────
+def obtener_embedding_seguro(img_matriz):
+    """
+    Intenta extraer el rostro. Si Android manda la foto girada,
+    rota la matriz automáticamente hasta encontrar la cara.
+    """
+    # Intento 1: Original
+    try:
+        return DeepFace.represent(img_path=img_matriz, model_name="Facenet512", detector_backend="mtcnn", enforce_detection=True)[0]["embedding"]
+    except ValueError:
+        pass
+
+    # Intento 2: Rotar 90 grados a la derecha
+    img_rotada_der = cv2.rotate(img_matriz, cv2.ROTATE_90_CLOCKWISE)
+    try:
+        return DeepFace.represent(img_path=img_rotada_der, model_name="Facenet512", detector_backend="mtcnn", enforce_detection=True)[0]["embedding"]
+    except ValueError:
+        pass
+
+    # Intento 3: Rotar 90 grados a la izquierda
+    img_rotada_izq = cv2.rotate(img_matriz, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    try:
+        return DeepFace.represent(img_path=img_rotada_izq, model_name="Facenet512", detector_backend="mtcnn", enforce_detection=True)[0]["embedding"]
+    except ValueError:
+        raise ValueError("No se detectó rostro en ninguna orientación.")
+
 def generar_embedding_s3(foto_url: str):
     """Descarga la imagen directamente desde S3 a la memoria RAM para DeepFace"""
-    
-    # 1. Extraer solo el "Key" interno de la URL de S3
-    # Ejemplo: quita el dominio y deja solo "ciudadanos/12345678.jpg"
     s3_key = foto_url.split(".amazonaws.com/")[-1]
     
     try:
-        # 2. Descargar los bytes puros usando Boto3 (Garantiza integridad 100%)
         respuesta = s3_client.get_object(Bucket=BUCKET_NAME, Key=s3_key)
         image_data = respuesta['Body'].read()
         
-        # 3. Convertir los bytes a una matriz de OpenCV 
         nparr = np.frombuffer(image_data, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
-        # 4. Generar el embedding pasando la matriz 'img' en lugar de un texto
-        resultado = DeepFace.represent(
-            img_path = img, 
-            model_name = "Facenet512",
-            detector_backend = "opencv",
-            enforce_detection= False  
-        )
-        return resultado[0]["embedding"]
+        # ¡CORRECCIÓN!: Usamos el extractor seguro y estricto, ya no opencv débil
+        return obtener_embedding_seguro(img)
         
     except Exception as e:
         print(f"Error procesando imagen de S3: {e}")
@@ -441,12 +456,12 @@ def verificar_rostro(request: RostroRequest, db: Session = Depends(get_db)):
     votante = db.query(models.Votante).filter(
         models.Votante.id == request.votante_id
     ).first()
+    
     if not votante:
         raise HTTPException(status_code=404, detail="Votante no encontrado.")
     if not request.foto_base64:
         raise HTTPException(status_code=400, detail="Captura facial vacía.")
 
-    # Limpieza por si Android envía cabeceras extrañas
     base64_data = request.foto_base64
     if "," in base64_data:
         base64_data = base64_data.split(",")[1]
@@ -455,29 +470,30 @@ def verificar_rostro(request: RostroRequest, db: Session = Depends(get_db)):
         image_data = base64.b64decode(base64_data)
         nparr = np.frombuffer(image_data, np.uint8)
         img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        # ── ¡MODO DEBUG: GUARDADO LOCAL! ─────────────────────────────────────
+        # Esto guardará la foto exactamente como la recibe el servidor desde Android.
+        # Podrás verla en la carpeta "uploads/ciudadanos/" de tu computadora.
+        ruta_debug = f"uploads/ciudadanos/debug_camara_{votante.dni}.jpg"
+        cv2.imwrite(ruta_debug, img)
+        print(f"📸 Foto de depuración guardada en: {ruta_debug}")
+        # ─────────────────────────────────────────────────────────────────────
+
     except Exception:
         raise HTTPException(status_code=400, detail="Imagen corrupta al decodificar.")
 
     try:
-        # EL CAMBIO ESTRELLA: Usar 'mtcnn' en lugar de 'opencv'
-        current = DeepFace.represent(
-            img_path         = img,
-            model_name       = "Facenet512",
-            detector_backend = "mtcnn", # Más potente y tolerante a la rotación móvil
-            enforce_detection= True     # Obligamos a que de verdad evalúe una cara
-        )[0]["embedding"]
+        # ¡CORRECCIÓN!: Usamos nuestra función inteligente de rotación
+        current = obtener_embedding_seguro(img)
 
         if votante.face_embedding is None:
-            # Ahora compara contra la foto en el almacén S3
             embedding_oficial = generar_embedding_s3(votante.foto_url)
-            distancia = np.linalg.norm(
-                np.array(current) - np.array(embedding_oficial)
-            )
+            distancia = np.linalg.norm(np.array(current) - np.array(embedding_oficial))
             print(f"Distancia facial (vs foto oficial S3) para {votante.dni}: {distancia}")
 
             if distancia < 10:
                 votante.face_embedding  = pickle.dumps(current)
-                votante.rostro_validado = True  # <-- ¡CORREGIDO! Antes decía False
+                votante.rostro_validado = True
                 db.commit()
                 return {"mensaje": "Acceso biométrico concedido."}
             else:
@@ -488,11 +504,11 @@ def verificar_rostro(request: RostroRequest, db: Session = Depends(get_db)):
             print(f"Distancia facial (vs embedding guardado) para {votante.dni}: {distancia}")
 
             if distancia < 10:
-                votante.rostro_validado = True  # <-- ¡CORREGIDO! Antes decía False
+                votante.rostro_validado = True 
                 db.commit()
-                return {"mensaje": "Acceso biométrico concedido."}
+                return {"mensaje": "Acceso biométrico concedido."} 
             else:
-                raise HTTPException(status_code=401, detail="Rostro no coincide.")
+                raise HTTPException(status_code=401, detail="Rostro no coincide.")  
 
     except ValueError as ve:
         print("ERROR DE DETECCIÓN FACIAL:", str(ve))
