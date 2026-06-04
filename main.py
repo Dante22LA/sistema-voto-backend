@@ -478,6 +478,7 @@ def verificar_rostro(request: RostroRequest, db: Session = Depends(get_db)):
         cv2.imwrite(ruta_debug, img)
         print(f"📸 Foto de depuración guardada en: {ruta_debug}")
         # ─────────────────────────────────────────────────────────────────────
+        # Pruebas de subida
 
     except Exception:
         raise HTTPException(status_code=400, detail="Imagen corrupta al decodificar.")
