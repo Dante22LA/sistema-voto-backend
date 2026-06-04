@@ -38,5 +38,5 @@ jobs:
             # Detiene y borra el contenedor viejo
             sudo docker rm -f servidor-biometrico
             
-            # Enciende el nuevo usando el VOLUMEN de la base de datos protegida
-            sudo docker run -d -p 8000:8000 -v /home/ubuntu/votacion.db:/app/votacion.db --name servidor-biometrico api-votacion
+            # Enciende el nuevo usando el VOLUMEN protegido y las LLAVES de AWS
+            sudo docker run -d -p 8000:8000 -v /home/ubuntu/votacion.db:/app/votacion.db -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} --name servidor-biometrico api-votacion
